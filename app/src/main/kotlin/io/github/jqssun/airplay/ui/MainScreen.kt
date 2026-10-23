@@ -20,6 +20,9 @@ import androidx.compose.material.icons.automirrored.filled.Article
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.rounded.BrightnessHigh
+import androidx.compose.material.icons.rounded.Wifi
+import androidx.compose.material.icons.rounded.Tv
+import androidx.compose.material.icons.rounded.Smartphone
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -45,6 +48,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -126,18 +130,44 @@ fun MainScreen(
         }
     }
 
-    // manual fullscreen over the idle preview is deliberate; only undo on disconnect
-    LaunchedEffect(connections) {
-        if (connections == 0) fullscreen = false
-    }
-
-    // leaving video playback must not fall through to a stale mirroring fullscreen
-    LaunchedEffect(videoPlaybackActive) {
-        if (videoPlaybackActive) fullscreen = false
-    }
-
     val activity = LocalContext.current as? Activity
-    val videoScreen = videoPlaybackActive || videoSessionPending
+    val hideOnDisconnect by viewModel.pref(Prefs.HIDE_ON_DISCONNECT).collectAsState()
+    var hadConnectedSession by remember { mutableStateOf(false) }
+    var hadVideoSession by remember { mutableStateOf(false) }
+    var isVideoSwitching by remember { mutableStateOf(false) }
+
+    // 监听视频播放状态：切集/切换节目时保持平滑过渡，防止 TV 桌面或指引卡片闪现
+    LaunchedEffect(videoPlaybackActive) {
+        if (videoPlaybackActive) {
+            hadVideoSession = true
+            isVideoSwitching = false
+            fullscreen = false
+        } else {
+            fullscreen = false
+            if (hadVideoSession && connections > 0) {
+                isVideoSwitching = true
+                delay(2500L)
+                isVideoSwitching = false
+            }
+        }
+    }
+
+    // 监听投屏断开：采用 1.5 秒防抖，避免切集/重连瞬间 Activity 反复退后台又弹前台
+    LaunchedEffect(connections) {
+        if (connections > 0) {
+            hadConnectedSession = true
+        } else if (hadConnectedSession && hideOnDisconnect) {
+            delay(1500L)
+            if (viewModel.connectionCount.value == 0 && !viewModel.videoPlaybackActive.value && !viewModel.mirroringActive.value) {
+                hadConnectedSession = false
+                hadVideoSession = false
+                isVideoSwitching = false
+                fullscreen = false
+                activity?.moveTaskToBack(true)
+            }
+        }
+    }
+    val videoScreen = videoPlaybackActive || videoSessionPending || isVideoSwitching
     LaunchedEffect(fullscreen, videoScreen) {
         val window = activity?.window ?: return@LaunchedEffect
         val controller = WindowInsetsControllerCompat(window, window.decorView)
@@ -176,9 +206,11 @@ fun MainScreen(
         val scrubbing = scrubPositionMs != null
         val downloading = downloadProgress != null
         var overlayVisible by remember { mutableStateOf(false) }
-        LaunchedEffect(overlayTick, playing, scrubbing, downloading, videoPlaybackActive) {
-            // tick 0 = fresh session; a pending session or a running download pins the overlay
-            if (!videoPlaybackActive) {
+        LaunchedEffect(overlayTick, playing, scrubbing, downloading, videoPlaybackActive, isVideoSwitching) {
+            // 切集过渡期不显示控制层，保持纯净黑屏
+            if (isVideoSwitching) {
+                overlayVisible = false
+            } else if (!videoPlaybackActive) {
                 overlayVisible = true
             } else if (overlayTick == 0L) {
                 overlayVisible = false
@@ -231,7 +263,12 @@ fun MainScreen(
             context.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
         }
         var showSpeedSelector by remember { mutableStateOf(false) }
-        BackHandler { viewModel.stopVideoPlayback() }
+        BackHandler { 
+            viewModel.stopVideoPlayback()
+            if (hideOnDisconnect) {
+                activity?.moveTaskToBack(true)
+            }
+        }
 
         val rootFocusRequester = remember { FocusRequester() }
         val playPauseFocusRequester = remember { FocusRequester() }
@@ -507,14 +544,92 @@ fun MainScreen(
         if (pin != null) fullscreen = false
     }
 
+    val tv = isTv()
     if (fullscreen) {
-        BackHandler { fullscreen = false }
+        BackHandler {
+            fullscreen = false
+            if (connections == 0 || (tv && hideOnDisconnect)) {
+                activity?.moveTaskToBack(true)
+            }
+        }
         FullscreenVideo(
             viewModel = viewModel,
             video = video,
-            onExitFullscreen = { fullscreen = false },
+            onExitFullscreen = {
+                fullscreen = false
+                if (connections == 0 || (tv && hideOnDisconnect)) {
+                    activity?.moveTaskToBack(true)
+                }
+            },
             onPip = onPip
         )
+    } else if (tv) {
+        BackHandler {
+            activity?.moveTaskToBack(true)
+        }
+        // 电视大屏：横向分栏，左侧垂直侧边栏，右侧主展示区
+        Row(modifier = Modifier.fillMaxSize().background(Color(0xFF121418))) {
+            NavigationRail(
+                modifier = Modifier
+                    .width(136.dp)
+                    .fillMaxHeight(),
+                containerColor = Color(0xFF1A1D24),
+                header = {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(top = 20.dp, bottom = 12.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF2A313E)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Rounded.Tv,
+                                contentDescription = null,
+                                tint = Color(0xFF64B5F6),
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = "AirPlay",
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            ) {
+                Spacer(Modifier.height(16.dp))
+                Tab.entries.forEach { t ->
+                    NavigationRailItem(
+                        selected = tab == t,
+                        onClick = { tab = t },
+                        icon = { Icon(t.icon, null, modifier = Modifier.size(24.dp)) },
+                        label = { Text(stringResource(t.labelRes), fontSize = 13.sp) },
+                        modifier = Modifier
+                            .padding(vertical = 6.dp, horizontal = 8.dp)
+                            .tvItemFocus(shape = RoundedCornerShape(12.dp))
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .background(Color(0xFF0F1115))
+            ) {
+                TabContent(
+                    tab, viewModel, video,
+                    onFullscreen = { fullscreen = true }, onPip = onPip, onLocalNetwork = onLocalNetwork,
+                    showAudioMode = audioOnly
+                )
+            }
+        }
     } else {
         Scaffold(
             bottomBar = {
@@ -610,9 +725,260 @@ private fun OverviewContent(
     val debugEnabled by viewModel.pref(Prefs.DEBUG_ENABLED).collectAsState()
     val debugInfo by viewModel.debugInfo.collectAsState()
     val tv = isTv()
+    val context = LocalContext.current
+    val localIp = remember(context) { getLocalIpAddress(context) }
+    val serverPort by viewModel.pref(Prefs.SERVER_PORT).collectAsState()
     val startFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         if (tv) startFocus.requestFocus()
+    }
+
+    if (tv) {
+        // 电视大屏定制概览布局
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp)
+        ) {
+            // 顶部横条：设备名、状态、IP与启动控制按钮
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E222B))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 18.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = serverName,
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                            Spacer(Modifier.width(16.dp))
+                            val isRunning = state == ServerState.RUNNING
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .background(if (isRunning) Color(0xFF1E4620) else Color(0xFF3E2723))
+                                    .padding(horizontal = 12.dp, vertical = 4.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(if (isRunning) Color(0xFF4CAF50) else Color(0xFFEF5350))
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = if (isRunning) "服务运行中" else "服务已停止",
+                                        color = if (isRunning) Color(0xFF81C784) else Color(0xFFE57373),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.Wifi, contentDescription = null, tint = Color.White.copy(alpha = 0.5f), modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "本机 IP: $localIp : $serverPort",
+                                color = Color.White.copy(alpha = 0.6f),
+                                fontSize = 13.sp
+                            )
+                            if (connections > 0) {
+                                Spacer(Modifier.width(16.dp))
+                                Text(
+                                    text = "已连接 $connections 台设备",
+                                    color = Color(0xFF64B5F6),
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (state == ServerState.RUNNING && (mirroringActive || connections > 0)) {
+                            FilledTonalButton(
+                                onClick = onFullscreen,
+                                modifier = Modifier.tvItemFocus(shape = RoundedCornerShape(12.dp))
+                            ) {
+                                Icon(Icons.Default.Fullscreen, contentDescription = null, modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("进入全屏", fontSize = 14.sp)
+                            }
+                        }
+
+                        val settings = localNetwork == LocalNetworkAccess.SETTINGS
+                        val (icon, label, action) = when {
+                            grant -> Triple(
+                                if (settings) Icons.Default.Settings else Icons.Default.LockOpen,
+                                if (settings) R.string.btn_open_settings else R.string.btn_allow,
+                                onLocalNetwork
+                            )
+                            state == ServerState.RUNNING -> Triple(Icons.Default.Stop, R.string.btn_stop, viewModel::stopServer)
+                            else -> Triple(Icons.Default.PlayArrow, R.string.btn_start, viewModel::startServer)
+                        }
+                        Button(
+                            onClick = action,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (state == ServerState.RUNNING) Color(0xFFC62828) else Color(0xFF1976D2)
+                            ),
+                            modifier = Modifier
+                                .tvItemFocus(shape = RoundedCornerShape(12.dp))
+                                .focusRequester(startFocus)
+                        ) {
+                            Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(stringResource(label), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(18.dp))
+
+            // 核心展示区域
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xFF161920)),
+                contentAlignment = Alignment.Center
+            ) {
+                if (showAudioMode && state == ServerState.RUNNING && connections > 0) {
+                    NowPlayingContent(viewModel)
+                } else if (state == ServerState.RUNNING && (mirroringActive || idlePreview)) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        video()
+                        // 浮动全屏快捷提示
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(16.dp)
+                                .clip(RoundedCornerShape(20.dp))
+                                .background(Color.Black.copy(alpha = 0.65f))
+                                .padding(horizontal = 16.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = "按遥控器 [OK] 键全屏播放",
+                                color = Color.White.copy(alpha = 0.85f),
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                } else if (connections > 0) {
+                    // 已有设备连接（等待视频流解析或切换节目中）：纯黑背景，彻底杜绝连接指引卡片闪现
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black)
+                    )
+                } else {
+                    // 等待连接：展示大气的三步指引
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp)
+                    ) {
+                        Text(
+                            text = if (state == ServerState.RUNNING) "等待苹果设备连接投屏..." else "投屏服务已停止，请点击右上角启动",
+                            color = Color.White.copy(alpha = 0.9f),
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(Modifier.height(24.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
+                            // 卡片 1
+                            Card(
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF20242D))
+                            ) {
+                                Column(modifier = Modifier.padding(20.dp)) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(44.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF2C3340)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Rounded.Wifi, null, tint = Color(0xFF64B5F6), modifier = Modifier.size(26.dp))
+                                    }
+                                    Spacer(Modifier.height(14.dp))
+                                    Text("第 1 步：连入同一 Wi-Fi", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                    Spacer(Modifier.height(6.dp))
+                                    Text("确保 iPhone/iPad/Mac 与本电视连入同一家庭局域网", fontSize = 13.sp, color = Color.White.copy(alpha = 0.6f))
+                                }
+                            }
+
+                            // 卡片 2
+                            Card(
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF20242D))
+                            ) {
+                                Column(modifier = Modifier.padding(20.dp)) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(44.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF2C3340)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Rounded.Smartphone, null, tint = Color(0xFF81C784), modifier = Modifier.size(26.dp))
+                                    }
+                                    Spacer(Modifier.height(14.dp))
+                                    Text("第 2 步：打开控制中心", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                    Spacer(Modifier.height(6.dp))
+                                    Text("从苹果设备屏幕右上角下拉，点击「屏幕镜像」图标", fontSize = 13.sp, color = Color.White.copy(alpha = 0.6f))
+                                }
+                            }
+
+                            // 卡片 3
+                            Card(
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF20242D))
+                            ) {
+                                Column(modifier = Modifier.padding(20.dp)) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(44.dp)
+                                            .clip(CircleShape)
+                                            .background(Color(0xFF2C3340)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Rounded.Tv, null, tint = Color(0xFFFFB74D), modifier = Modifier.size(26.dp))
+                                    }
+                                    Spacer(Modifier.height(14.dp))
+                                    Text("第 3 步：选择本机名称", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                    Spacer(Modifier.height(6.dp))
+                                    Text("在镜像列表中点击「$serverName」，即可秒速同屏！", fontSize = 13.sp, color = Color.White.copy(alpha = 0.6f))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return
     }
 
     Column(modifier = Modifier.fillMaxSize()) {

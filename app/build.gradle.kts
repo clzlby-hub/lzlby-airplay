@@ -15,38 +15,23 @@ val allAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
 
 android {
     namespace = "io.github.jqssun.airplay"
-    compileSdk = 37
-    ndkVersion = "27.0.12077973"
-
-    if (localProps.containsKey("storeFile")) {
-        signingConfigs {
-            create("release") {
-                storeFile = file(localProps.getProperty("storeFile"))
-                storePassword = localProps.getProperty("storePassword")
-                keyAlias = localProps.getProperty("keyAlias")
-                keyPassword = localProps.getProperty("keyPassword")
-            }
-        }
-    }
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "io.github.jqssun.airplay"
         minSdk = 23
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 36
         versionName = "0.0.36"
 
-        externalNativeBuild {
-            cmake {
-                arguments += "-DANDROID_STL=c++_shared"
-                arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
-            }
+        ndk {
+            abiFilters += allAbis
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("src/main/jniLibs")
         }
     }
 
@@ -57,20 +42,8 @@ android {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfigs.findByName("release")?.let { signingConfig = it }
             ndk { abiFilters += allAbis }
-        }
-        // debuggable build with HWASan (arm64) + UBSan in native code
-        create("sanitize") {
-            initWith(getByName("debug"))
-            matchingFallbacks += "debug"
-            ndk {
-                abiFilters.clear()
-                abiFilters += "arm64-v8a"
-            }
-            externalNativeBuild {
-                cmake { arguments += "-DSANITIZE=ON" }
-            }
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -90,26 +63,7 @@ android {
     }
 }
 
-tasks.register("applyUxplayPatches") {
-    doLast {
-        fun git(vararg args: String): String {
-            val proc = ProcessBuilder("git", "-C", "$projectDir/src/main/cpp/third_party/UxPlay", *args)
-                .redirectErrorStream(true).start()
-            val out = proc.inputStream.bufferedReader().readText()
-            check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed:\n$out" }
-            return out
-        }
-        val patches = file("src/main/cpp/patches/UxPlay").listFiles { f -> f.extension == "patch" }!!.sorted()
-        val touched = patches.flatMap { git("apply", "--numstat", it.path).trim().lines() }
-            .map { it.substringAfterLast("\t") }.distinct()
-        git("checkout", "--", *touched.toTypedArray())
-        patches.forEach { git("apply", "--unidiff-zero", it.path) }
-    }
-}
-
-tasks.configureEach {
-    if (name.startsWith("configureCMake")) dependsOn("applyUxplayPatches")
-}
+// Native build replaced by prebuilt jniLibs
 
 dependencies {
     implementation(libs.androidx.core.ktx)

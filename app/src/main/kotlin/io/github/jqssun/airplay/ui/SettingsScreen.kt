@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
@@ -17,6 +18,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -24,6 +26,8 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.font.FontWeight
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -54,6 +58,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
     val overscanned by viewModel.pref(Prefs.OVERSCANNED).collectAsState()
     val requirePin by viewModel.pref(Prefs.REQUIRE_PIN).collectAsState()
     val allowNewConn by viewModel.pref(Prefs.ALLOW_NEW_CONN).collectAsState()
+    val hideOnDisconnect by viewModel.pref(Prefs.HIDE_ON_DISCONNECT).collectAsState()
     val usbOnly by viewModel.pref(Prefs.USB_ONLY).collectAsState()
     val autoStart by viewModel.pref(Prefs.AUTO_START).collectAsState()
     val bootAutoStart by viewModel.pref(Prefs.BOOT_AUTO_START).collectAsState()
@@ -85,7 +90,7 @@ fun SettingsScreen(viewModel: MainViewModel) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(vertical = 8.dp)
+            .padding(horizontal = 24.dp, vertical = 12.dp)
     ) {
         SectionHeader(stringResource(R.string.section_server))
 
@@ -143,6 +148,13 @@ fun SettingsScreen(viewModel: MainViewModel) {
             onCheckedChange = { viewModel.set(Prefs.ALLOW_NEW_CONN, it) }
         )
 
+        SettingSwitch(
+            title = stringResource(R.string.setting_hide_on_disconnect),
+            description = stringResource(R.string.setting_hide_on_disconnect_desc),
+            checked = hideOnDisconnect,
+            onCheckedChange = { viewModel.set(Prefs.HIDE_ON_DISCONNECT, it) }
+        )
+
         val ctx = LocalContext.current
         val lifecycleOwner = LocalLifecycleOwner.current
         var hasOverlayPermission by remember { mutableStateOf(canAutoLaunch(ctx)) }
@@ -155,26 +167,16 @@ fun SettingsScreen(viewModel: MainViewModel) {
         }
         val needsOverlayPermission = launchOnConnect && !hasOverlayPermission
         val autoLaunch = launchOnConnect && hasOverlayPermission
-        ListItem(
-            modifier = Modifier
-                .dpadFocus(RectangleShape)
-                .toggleable(
-                    value = autoLaunch,
-                    role = Role.Switch,
-                    onValueChange = {
-                        viewModel.set(Prefs.LAUNCH_ON_CONNECT, it)
-                        if (it && !canAutoLaunch(ctx)) _openOverlaySettings(ctx)
-                    }
-                ),
-            headlineContent = { Text(stringResource(R.string.setting_launch_on_connect)) },
-            supportingContent = {
-                Text(stringResource(
-                    if (needsOverlayPermission) R.string.setting_launch_on_connect_no_permission
-                    else R.string.setting_launch_on_connect_desc
-                ))
-            },
-            trailingContent = {
-                Switch(checked = autoLaunch, onCheckedChange = null)
+        SettingSwitch(
+            title = stringResource(R.string.setting_launch_on_connect),
+            description = stringResource(
+                if (needsOverlayPermission) R.string.setting_launch_on_connect_no_permission
+                else R.string.setting_launch_on_connect_desc
+            ),
+            checked = autoLaunch,
+            onCheckedChange = {
+                viewModel.set(Prefs.LAUNCH_ON_CONNECT, it)
+                if (it && !canAutoLaunch(ctx)) _openOverlaySettings(ctx)
             }
         )
 
@@ -359,6 +361,11 @@ fun SettingsScreen(viewModel: MainViewModel) {
             if (audioLatencyMs >= 0) {
                 var sliderVal by remember(audioLatencyMs) { mutableFloatStateOf(audioLatencyMs.toFloat()) }
                 ListItem(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 3.dp)
+                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp)),
+                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     headlineContent = {
                         Slider(
                             value = sliderVal,
@@ -387,6 +394,11 @@ fun SettingsScreen(viewModel: MainViewModel) {
                 val maxStep = Prefs.AUDIO_ADAPTIVE_STEP.range.last
                 var stepVal by remember(audioAdaptiveStep) { mutableFloatStateOf(audioAdaptiveStep.toFloat()) }
                 ListItem(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 3.dp)
+                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp)),
+                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                     headlineContent = {
                         Slider(
                             value = stepVal,
@@ -460,9 +472,10 @@ private fun _openOverlaySettings(ctx: Context) {
 private fun SectionHeader(title: String) {
     Text(
         text = title,
-        style = MaterialTheme.typography.titleSmall,
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.Bold,
         color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+        modifier = Modifier.padding(start = 16.dp, top = 20.dp, bottom = 8.dp)
     )
 }
 
@@ -489,10 +502,15 @@ private fun SettingResolution(
     var height by remember(value) { mutableStateOf(if (isPreset) "" else parts.getOrElse(1) { "" }) }
 
     ListItem(
-        headlineContent = { Text(stringResource(R.string.setting_resolution)) },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp)),
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        headlineContent = { Text(stringResource(R.string.setting_resolution), fontWeight = FontWeight.Medium) },
         supportingContent = {
             Column {
-                Text(stringResource(R.string.setting_resolution_desc))
+                Text(stringResource(R.string.setting_resolution_desc), color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
                 Spacer(Modifier.height(8.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     @Composable
@@ -504,14 +522,14 @@ private fun SettingResolution(
                             onValueChange(key)
                         },
                         label = { Text(label) },
-                        modifier = Modifier.dpadFocus()
+                        modifier = Modifier.tvItemFocus(RoundedCornerShape(8.dp))
                     )
                     presets.forEach { (key, label) -> presetChip(key, label) }
                     FilterChip(
                         selected = !isPreset || editing,
                         onClick = { editing = true },
                         label = { Text(stringResource(R.string.chip_custom)) },
-                        modifier = Modifier.dpadFocus()
+                        modifier = Modifier.tvItemFocus(RoundedCornerShape(8.dp))
                     )
                     devicePresets.forEach { (key, label) -> presetChip(key, label) }
                 }
@@ -523,6 +541,7 @@ private fun SettingResolution(
                             onValueChange = { width = it.filter { c -> c.isDigit() }.take(5) },
                             singleLine = true,
                             label = { Text(stringResource(R.string.setting_resolution_width)) },
+                            shape = RoundedCornerShape(8.dp),
                             keyboardOptions = KeyboardOptions(
                                 keyboardType = KeyboardType.Number,
                                 imeAction = ImeAction.Next
@@ -534,6 +553,7 @@ private fun SettingResolution(
                             onValueChange = { height = it.filter { c -> c.isDigit() }.take(5) },
                             singleLine = true,
                             label = { Text(stringResource(R.string.setting_resolution_height)) },
+                            shape = RoundedCornerShape(8.dp),
                             keyboardOptions = KeyboardOptions(
                                 keyboardType = KeyboardType.Number,
                                 imeAction = ImeAction.Done
@@ -581,6 +601,7 @@ private fun SettingTextField(
         supportingText = description?.let { { Text(it) } },
         singleLine = true,
         isError = !valid,
+        shape = RoundedCornerShape(12.dp),
         keyboardOptions = KeyboardOptions(
             keyboardType = if (range == null) KeyboardType.Text else KeyboardType.Number,
             imeAction = ImeAction.Done
@@ -588,8 +609,7 @@ private fun SettingTextField(
         keyboardActions = doneAndHide(::save),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp)
-            .padding(bottom = 8.dp)
+            .padding(vertical = 3.dp)
             .onFocusChanged { if (!it.isFocused) save() }
     )
 }
@@ -609,17 +629,22 @@ private fun SettingChipField(
     var text by remember(value) { mutableStateOf(if (isPreset) "" else value) }
 
     ListItem(
-        headlineContent = { Text(title) },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp)),
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        headlineContent = { Text(title, fontWeight = FontWeight.Medium) },
         supportingContent = {
             Column {
-                Text(description)
+                Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
                 Spacer(Modifier.height(8.dp))
                 ChipRow(if (editing) "" else value, presets, { editing = false; text = ""; onValueChange(it) }) {
                     FilterChip(
                         selected = !isPreset || editing,
                         onClick = { editing = true },
                         label = { Text(stringResource(R.string.chip_custom)) },
-                        modifier = Modifier.dpadFocus()
+                        modifier = Modifier.tvItemFocus(RoundedCornerShape(8.dp))
                     )
                 }
                 if (editing || !isPreset) {
@@ -629,6 +654,7 @@ private fun SettingChipField(
                         onValueChange = { text = it },
                         singleLine = true,
                         label = { Text(placeholder) },
+                        shape = RoundedCornerShape(8.dp),
                         keyboardOptions = KeyboardOptions(
                             keyboardType = keyboardType,
                             imeAction = ImeAction.Done
@@ -661,7 +687,7 @@ private fun ChipRow(
                 selected = value == key,
                 onClick = { onSelect(key) },
                 label = { Text(label) },
-                modifier = Modifier.dpadFocus()
+                modifier = Modifier.tvItemFocus(RoundedCornerShape(8.dp))
             )
         }
         trailing()
@@ -677,10 +703,15 @@ private fun SettingChips(
     onValueChange: (String) -> Unit
 ) {
     ListItem(
-        headlineContent = { Text(title) },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp)),
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        headlineContent = { Text(title, fontWeight = FontWeight.Medium) },
         supportingContent = {
             Column {
-                Text(description)
+                Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
                 Spacer(Modifier.height(8.dp))
                 ChipRow(value, options, onValueChange)
             }
@@ -697,7 +728,12 @@ private fun <T> SettingSegmented(
     onValueChange: (T) -> Unit
 ) {
     ListItem(
-        headlineContent = { Text(title) },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp)),
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        headlineContent = { Text(title, fontWeight = FontWeight.Medium) },
         supportingContent = {
             Column {
                 Spacer(Modifier.height(8.dp))
@@ -708,13 +744,13 @@ private fun <T> SettingSegmented(
                             selected = value == key,
                             onClick = { onValueChange(key) },
                             shape = shape,
-                            modifier = Modifier.dpadFocus(shape),
+                            modifier = Modifier.tvItemFocus(shape),
                             label = { Text(label) }
                         )
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                Text(summary)
+                Text(summary, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f))
             }
         }
     )
@@ -729,10 +765,13 @@ private fun SettingSwitch(
 ) {
     ListItem(
         modifier = Modifier
-            .dpadFocus(RectangleShape)
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .tvItemFocus(RoundedCornerShape(12.dp))
             .toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange),
-        headlineContent = { Text(title) },
-        supportingContent = { Text(description) },
+        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+        headlineContent = { Text(title, fontWeight = FontWeight.Medium) },
+        supportingContent = { Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f)) },
         trailingContent = { Switch(checked = checked, onCheckedChange = null) }
     )
 }
