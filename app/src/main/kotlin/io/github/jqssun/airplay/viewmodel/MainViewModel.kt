@@ -188,6 +188,13 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
     private val _mirroringActive = MutableStateFlow(false)
     val mirroringActive: StateFlow<Boolean> = _mirroringActive.asStateFlow()
 
+    private val _mirrorSessionSeq = MutableStateFlow(0L)
+    val mirrorSessionSeq: StateFlow<Long> = _mirrorSessionSeq.asStateFlow()
+
+    private val _retreatingToDesktop = MutableStateFlow(false)
+    val retreatingToDesktop: StateFlow<Boolean> = _retreatingToDesktop.asStateFlow()
+    fun setRetreatingToDesktop(v: Boolean) { _retreatingToDesktop.value = v }
+
     private val _trackInfo = MutableStateFlow(TrackInfo())
     val trackInfo: StateFlow<TrackInfo> = _trackInfo.asStateFlow()
 
@@ -421,6 +428,7 @@ class MainViewModel @Inject constructor(app: Application) : AndroidViewModel(app
                 _videoBuffering.value = false
             }
             _mirroringActive.value = it.mirroringActive.value
+            _mirrorSessionSeq.value = it.mirrorSessionSeq.value
             _trackInfo.value = it.trackInfo.value
             _clientVolume.value = it.clientVolume()
             _clientVolumeAdjustable.value = it.dacpController?.ready == true

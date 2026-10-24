@@ -146,6 +146,19 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     private val _mirroringActive = MutableStateFlow(false)
     val mirroringActive = _mirroringActive.asStateFlow()
 
+    // bumped per mirror session start so auto-fullscreen re-triggers cleanly on every return to mirroring
+    private val _mirrorSessionSeq = MutableStateFlow(0L)
+    val mirrorSessionSeq = _mirrorSessionSeq.asStateFlow()
+
+    @Volatile private var _hadConnectedSession = false
+    private var _lastRetreatAtMs = 0L
+    @Volatile private var _lastVideoStopAtMs = 0L
+    private var _mirrorFrameWaitCount = 0
+
+    var stateChangedCallback: (() -> Unit)? = null
+    var prepareBringToFrontCallback: (() -> Unit)? = null
+    var retreatToDesktopCallback: (() -> Boolean)? = null
+
     private val _trackInfo = MutableStateFlow(TrackInfo())
     val trackInfo = _trackInfo.asStateFlow()
 
@@ -310,7 +323,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
             _videoPlaybackSize.value = width to height
         }
         airPlayVideoPlayer.onTitle = { _videoTitle.value = it ?: "" }
-        airPlayVideoPlayer.onEnded = { _endVideoPlayback("AirPlay Video stopped (player)") }
+        airPlayVideoPlayer.onEnded = { _endVideoPlayback("AirPlay Video stopped (player)", triggerRetreat = true, forceBeat = true) }
         airPlayVideoPlayer.onPlaybackInfo = { snapshot ->
             if (nativeHandle != 0L) {
                 NativeBridge.nativeUpdatePlaybackInfo(nativeHandle, snapshot.position, snapshot.duration, snapshot.rate, snapshot.ready)
@@ -548,6 +561,10 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         videoRenderer.release()
         airPlayVideoPlayer.stop()
         mediaSession?.isActive = false
+        _mainHandler.removeCallbacks(_bringToFrontRunnable)
+        _hadConnectedSession = false
+        _lastRetreatAtMs = 0L
+        _lastVideoStopAtMs = 0L
         _audioOnly.value = false
         _videoPlaybackActive.value = false
         _mirroringActive.value = false
@@ -607,20 +624,36 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         airPlayVideoPlayer.seekBy(deltaMs)
     }
 
-    fun stopVideoPlayback() = _endVideoPlayback("AirPlay Video stopped (local)")
+    fun stopVideoPlayback() = _endVideoPlayback(
+        "AirPlay Video stopped (local)",
+        triggerRetreat = true,
+        forceBeat = true,
+        allowWithoutOverlay = true
+    )
 
     fun downloadVideo() {
         _videoLocation.value?.let { videoDownloader.start(it) }
     }
 
-    private fun _endVideoPlayback(message: String) {
+    private fun _endVideoPlayback(
+        message: String,
+        triggerRetreat: Boolean = true,
+        forceBeat: Boolean = false,
+        allowWithoutOverlay: Boolean = false
+    ) {
         if (!_videoPlaybackActive.value) return
         // lingering polls after a stop must not bounce the UI back to a pending session
         _videoPollSuppressed = true
         _videoPlaybackActive.value = false
+        _lastVideoStopAtMs = SystemClock.elapsedRealtime()
         airPlayVideoPlayer.stop()
         if (!_audioOnly.value) mediaSession?.isActive = false
         log(message)
+        if (triggerRetreat && (forceBeat || !_mirroringActive.value)) {
+            _requestDesktopRetreat(forceBeat = forceBeat, allowWithoutOverlay = allowWithoutOverlay)
+        } else {
+            _notifyStateChanged()
+        }
     }
 
     override fun onDestroy() {
@@ -652,6 +685,9 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     override fun onVideoPlay(location: String, startPositionSeconds: Float) {
+        val wasShowingContent = _mirroringActive.value || _videoPlaybackActive.value
+        clearPin()
+        _setAudioOnly(false)
         _videoLocation.value = location
         _videoPlaySeq.value++
         _videoPollSuppressed = false
@@ -664,6 +700,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         // claim media-button routing for keys that arrive as media-session events
         mediaSession?.isActive = true
         log("AirPlay Video play: $location @ ${startPositionSeconds}s")
+        _scheduleBringToFront(retreatFirst = wasShowingContent)
     }
 
     override fun onVideoScrub(positionSeconds: Float) {
@@ -674,15 +711,15 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         airPlayVideoPlayer.setRate(rate)
     }
 
-    override fun onVideoStop() = _endVideoPlayback("AirPlay Video stopped")
+    override fun onVideoStop() = _endVideoPlayback("AirPlay Video stopped", triggerRetreat = true, forceBeat = true)
 
     override fun onAudioFormat(ct: Int, spf: Int, usingScreen: Boolean) {
         clearPin()
         audioRenderer.start()
         audioRenderer.setFormat(ct, spf)
         if (!usingScreen) _setPlaying(true)
-        if (!usingScreen && !_audioOnly.value) {
-            // pure music streaming (not screen mirroring audio)
+        if (!usingScreen && !_audioOnly.value && !_videoPlaybackActive.value && !videoSessionPending()) {
+            // pure music streaming (not screen mirroring audio or video silent raop)
             _setAudioOnly(true)
         }
         log("Audio format: ct=$ct spf=$spf screen=$usingScreen")
@@ -691,10 +728,16 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     override fun onVideoSize(srcW: Float, srcH: Float, w: Float, h: Float) {
         clearPin()
         if (w > 0 && h > 0) {
+            val wasMirroring = _mirroringActive.value
             _videoAspect.value = w / h
             _videoResolution.value = "${w.toInt()}x${h.toInt()}"
             videoRenderer.setResolution(w.toInt(), h.toInt())
             _mirroringActive.value = true
+            if (!wasMirroring) {
+                _scheduleBringToFront()
+            } else {
+                _notifyStateChanged()
+            }
         }
         log("Video size: ${srcW}x${srcH} -> ${w}x${h}")
     }
@@ -794,17 +837,24 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     override fun onConnectionInit() {
-        val firstConnection = _connectionCount.value == 0
+        _hadConnectedSession = true
         _connectionCount.value++
         log("Sender connected (${_connectionCount.value})")
-        if (firstConnection && shouldLaunchOnConnect()) launchMainActivity()
+        _notifyStateChanged()
     }
 
     override fun onConnectionDestroy() {
         _connectionCount.value = (_connectionCount.value - 1).coerceAtLeast(0)
         if (_connectionCount.value == 0) {
+            val hadSession = _hadConnectedSession
+            _hadConnectedSession = false
             // clients may drop without POST /stop; must run before the poll-state reset
-            _endVideoPlayback("AirPlay Video stopped (disconnect)")
+            _endVideoPlayback("AirPlay Video stopped (disconnect)", triggerRetreat = false)
+            if (_mirroringActive.value) {
+                videoRenderer.stopSession()
+                _mirroringActive.value = false
+            }
+            clearPin()
             // last client gone: release audio output devices to save power
             audioRenderer.stop()
             _audioOnly.value = false
@@ -827,6 +877,11 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
             mediaSession?.isActive = false
             _refreshDacpPlayer()
             _updateMediaNotification()
+            if (hadSession) {
+                _requestDesktopRetreat(allowWithoutOverlay = true)
+            } else {
+                _notifyStateChanged()
+            }
         }
         log("Sender disconnected (${_connectionCount.value})")
     }
@@ -840,6 +895,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         _lastPin = pin
         pinCallback?.invoke(pin)
         _updateMediaNotification()
+        _scheduleBringToFront()
     }
 
     override fun onMetadata(data: ByteArray) {
@@ -885,11 +941,28 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     override fun onMirrorRunning(running: Boolean) {
-        if (running) videoRenderer.startSession() else {
+        if (running) {
+            if (_videoPlaybackActive.value) {
+                _endVideoPlayback(
+                    "AirPlay Video preempted by Mirroring",
+                    triggerRetreat = true,
+                    forceBeat = true
+                )
+            }
+            videoRenderer.startSession()
+            _mirrorSessionSeq.value++
+            _setAudioOnly(false)
+            _notifyStateChanged()
+        } else {
+            val wasMirroring = _mirroringActive.value
             videoRenderer.stopSession()
             _mirroringActive.value = false
+            if (wasMirroring && !_videoPlaybackActive.value) {
+                _requestDesktopRetreat(forceBeat = true)
+            } else {
+                _notifyStateChanged()
+            }
         }
-        _setAudioOnly(!running)
     }
 
     private fun _setAudioOnly(audioOnly: Boolean) {
@@ -1003,6 +1076,7 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
     }
 
     private fun clearPin() {
+        if (_lastPin == null) return
         _lastPin = null
         pinCallback?.invoke(null)
         _updateMediaNotification()
@@ -1142,14 +1216,97 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
         return builder.build()
     }
 
-    private fun launchMainActivity() {
-        Handler(Looper.getMainLooper()).post {
-            val launchIntent = Intent(this, MainActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+    private fun _canAutoLaunchFromBackground(): Boolean =
+        prefs[Prefs.LAUNCH_ON_CONNECT] &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || android.provider.Settings.canDrawOverlays(this))
+
+    fun useAppleDesktopTransition(): Boolean =
+        prefs[Prefs.HIDE_ON_DISCONNECT] && _canAutoLaunchFromBackground()
+
+    private fun _notifyStateChanged() {
+        _mainHandler.post { stateChangedCallback?.invoke() }
+    }
+
+    private val _bringToFrontRunnable = object : Runnable {
+        override fun run() {
+            if (_serverState.value != ServerState.RUNNING) return
+            if (!_mirroringActive.value && !_videoPlaybackActive.value && _lastPin == null) return
+            if (_mirroringActive.value && !_videoPlaybackActive.value && _lastPin == null) {
+                if (!_videoPollSuppressed &&
+                    SystemClock.elapsedRealtime() - _lastVideoPollAt < VIDEO_POLL_PENDING_TIMEOUT_MS) {
+                    _mainHandler.postDelayed(this, 400L)
+                    return
+                }
+                if (!videoRenderer.hasRenderedFrame && _mirrorFrameWaitCount < MAX_MIRROR_FRAME_WAITS) {
+                    _mirrorFrameWaitCount++
+                    _mainHandler.postDelayed(this, MIRROR_FRAME_POLL_MS)
+                    return
+                }
+            }
+            prepareBringToFrontCallback?.invoke()
+            stateChangedCallback?.invoke()
+            val launchIntent = Intent(this@AirPlayService, MainActivity::class.java).addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
+            )
             try {
                 startActivity(launchIntent)
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to launch activity", e)
+            }
+        }
+    }
+
+    private fun _requestDesktopRetreat(
+        forceBeat: Boolean = false,
+        allowWithoutOverlay: Boolean = false
+    ) {
+        _mainHandler.post {
+            _mainHandler.removeCallbacks(_bringToFrontRunnable)
+            val allowed = if (allowWithoutOverlay) prefs[Prefs.HIDE_ON_DISCONNECT] else useAppleDesktopTransition()
+            val shouldRetreat = allowed &&
+                (forceBeat || (!_mirroringActive.value && !_videoPlaybackActive.value && _lastPin == null))
+            if (shouldRetreat) {
+                if (retreatToDesktopCallback?.invoke() == true) {
+                    _lastRetreatAtMs = SystemClock.elapsedRealtime()
+                }
+            }
+            stateChangedCallback?.invoke()
+        }
+    }
+
+    private fun _scheduleBringToFront(retreatFirst: Boolean = false) {
+        _mainHandler.post {
+            _mainHandler.removeCallbacks(_bringToFrontRunnable)
+            _mirrorFrameWaitCount = 0
+            if (retreatFirst && useAppleDesktopTransition()) {
+                if (retreatToDesktopCallback?.invoke() == true) {
+                    _lastRetreatAtMs = SystemClock.elapsedRealtime()
+                }
+            }
+            stateChangedCallback?.invoke()
+            if (!shouldLaunchOnConnect()) return@post
+            if (!_mirroringActive.value && !_videoPlaybackActive.value && _lastPin == null) return@post
+            val now = SystemClock.elapsedRealtime()
+            val sinceRetreat = if (_lastRetreatAtMs > 0L) now - _lastRetreatAtMs else Long.MAX_VALUE
+            val sinceVideoStop = if (_lastVideoStopAtMs > 0L) now - _lastVideoStopAtMs else Long.MAX_VALUE
+            val waitMs = when {
+                _videoPlaybackActive.value || _lastPin != null ->
+                    (VIDEO_DESKTOP_BEAT_MS - sinceRetreat).coerceAtLeast(0L)
+                sinceVideoStop < POST_VIDEO_WINDOW_MS ->
+                    maxOf(
+                        POST_VIDEO_MIRROR_SETTLE_MS - sinceVideoStop,
+                        DESKTOP_SETTLE_MS - sinceRetreat,
+                        0L
+                    )
+                else ->
+                    (DESKTOP_SETTLE_MS - sinceRetreat).coerceAtLeast(0L)
+            }
+            if (waitMs == 0L) {
+                _bringToFrontRunnable.run()
+            } else {
+                _mainHandler.postDelayed(_bringToFrontRunnable, waitMs)
             }
         }
     }
@@ -1193,6 +1350,12 @@ class AirPlayService : LifecycleService(), RaopCallbackHandler, LogListener {
 
         private const val AUDIO_CONFIG_DEBOUNCE_MS = 500L
         private const val SERVER_RESTART_DEBOUNCE_MS = 500L
+        private const val VIDEO_DESKTOP_BEAT_MS = 650L
+        private const val DESKTOP_SETTLE_MS = 650L
+        private const val POST_VIDEO_MIRROR_SETTLE_MS = 1_350L
+        private const val POST_VIDEO_WINDOW_MS = 2_500L
+        private const val MIRROR_FRAME_POLL_MS = 30L
+        private const val MAX_MIRROR_FRAME_WAITS = 12
 
         // airplay volume is linear in dB along sender slider
         private fun _dbToFrac(db: Float) = if (db <= -144f) 0f else ((db + 30f) / 30f).coerceIn(0f, 1f)

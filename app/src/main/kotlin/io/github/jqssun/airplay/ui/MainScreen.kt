@@ -52,6 +52,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import io.github.jqssun.airplay.MainActivity
 import io.github.jqssun.airplay.Prefs
 import io.github.jqssun.airplay.R
 import io.github.jqssun.airplay.service.AirPlayService.ServerState
@@ -100,15 +101,25 @@ fun MainScreen(
     onPip: () -> Unit = {},
     onLocalNetwork: () -> Unit = {}
 ) {
+    val tv = isTv()
     var tab by remember { mutableStateOf(Tab.OVERVIEW) }
-    var fullscreen by remember { mutableStateOf(false) }
     val pin by viewModel.pinCode.collectAsState()
     val connections by viewModel.connectionCount.collectAsState()
     val audioOnly by viewModel.audioOnly.collectAsState()
     val videoPlaybackActive by viewModel.videoPlaybackActive.collectAsState()
     val videoSessionPending by viewModel.videoSessionPending.collectAsState()
     val mirroringActive by viewModel.mirroringActive.collectAsState()
+    val mirrorSessionSeq by viewModel.mirrorSessionSeq.collectAsState()
+    val retreating by viewModel.retreatingToDesktop.collectAsState()
     val autoFullscreen by viewModel.pref(Prefs.AUTO_FULLSCREEN).collectAsState()
+
+    var exitedFullscreenForSession by remember { mutableLongStateOf(-1L) }
+    var manualFullscreenSession by remember { mutableLongStateOf(-1L) }
+
+    // compute fullscreen synchronously on frame 0 so OverviewContent never flashes on resume
+    val fullscreen = mirroringActive && !audioOnly && !videoPlaybackActive && pin == null &&
+        ((autoFullscreen && exitedFullscreenForSession != mirrorSessionSeq) ||
+            manualFullscreenSession == mirrorSessionSeq)
 
     // don't use movableContentOf: moving AndroidView across subcomposition boundaries makes it crash on reparent
     val video: @Composable () -> Unit = {
@@ -120,63 +131,44 @@ fun MainScreen(
         )
     }
 
-    // fullscreen only once mirroring reports a size: connections rise before the kind is known
-    var prevMirroringActive by remember { mutableStateOf(false) }
-    LaunchedEffect(mirroringActive, audioOnly, videoPlaybackActive, pin) {
-        val justStarted = !prevMirroringActive && mirroringActive
-        prevMirroringActive = mirroringActive
-        if (justStarted && !audioOnly && !videoPlaybackActive && autoFullscreen && pin == null) {
-            fullscreen = true
-        }
-    }
-
     val activity = LocalContext.current as? Activity
     val hideOnDisconnect by viewModel.pref(Prefs.HIDE_ON_DISCONNECT).collectAsState()
-    var hadConnectedSession by remember { mutableStateOf(false) }
     var hadVideoSession by remember { mutableStateOf(false) }
     var isVideoSwitching by remember { mutableStateOf(false) }
 
-    // 监听视频播放状态：切集/切换节目时保持平滑过渡，防止 TV 桌面或指引卡片闪现
+    // fallback black bridge when staying in foreground (e.g. without overlay permission or hideOnDisconnect off)
     LaunchedEffect(videoPlaybackActive) {
         if (videoPlaybackActive) {
             hadVideoSession = true
             isVideoSwitching = false
-            fullscreen = false
+        } else if (hadVideoSession && connections > 0 && !mirroringActive && !retreating) {
+            isVideoSwitching = true
+            delay(2500L)
+            isVideoSwitching = false
         } else {
-            fullscreen = false
-            if (hadVideoSession && connections > 0) {
-                isVideoSwitching = true
-                delay(2500L)
-                isVideoSwitching = false
-            }
+            isVideoSwitching = false
         }
     }
 
-    // 监听投屏断开：采用 1.5 秒防抖，避免切集/重连瞬间 Activity 反复退后台又弹前台
-    LaunchedEffect(connections) {
-        if (connections > 0) {
-            hadConnectedSession = true
-        } else if (hadConnectedSession && hideOnDisconnect) {
-            delay(1500L)
-            if (viewModel.connectionCount.value == 0 && !viewModel.videoPlaybackActive.value && !viewModel.mirroringActive.value) {
-                hadConnectedSession = false
-                hadVideoSession = false
-                isVideoSwitching = false
-                fullscreen = false
-                activity?.moveTaskToBack(true)
-            }
-        }
-    }
-    val videoScreen = videoPlaybackActive || videoSessionPending || isVideoSwitching
-    LaunchedEffect(fullscreen, videoScreen) {
+    val videoScreen = videoPlaybackActive ||
+        (videoSessionPending && !mirroringActive) ||
+        (isVideoSwitching && !mirroringActive && !retreating)
+
+    LaunchedEffect(fullscreen, videoScreen, retreating) {
         val window = activity?.window ?: return@LaunchedEffect
         val controller = WindowInsetsControllerCompat(window, window.decorView)
-        if (fullscreen || videoScreen) {
+        if (fullscreen || videoScreen || retreating) {
             controller.hide(WindowInsetsCompat.Type.systemBars())
             controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         } else {
             controller.show(WindowInsetsCompat.Type.systemBars())
         }
+    }
+
+    // render pure black during the moveTaskToBack window fade-out so OverviewContent never flashes
+    if (retreating) {
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black))
+        return
     }
 
     if (videoScreen) {
@@ -211,7 +203,7 @@ fun MainScreen(
             if (isVideoSwitching) {
                 overlayVisible = false
             } else if (!videoPlaybackActive) {
-                overlayVisible = true
+                overlayVisible = !tv
             } else if (overlayTick == 0L) {
                 overlayVisible = false
             } else {
@@ -243,16 +235,20 @@ fun MainScreen(
         DisposableEffect(brightnessState) {
             onDispose { brightnessState?.clearOverride() }
         }
-        // orientation follows the video aspect; manual rotate holds until the next video
+        // orientation follows the video aspect on handhelds; never force portrait rotation on TV
         LaunchedEffect(videoPlaybackAspect) {
-            activity?.requestedOrientation = if (videoPlaybackAspect < 1f) {
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-            } else {
-                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            if (!tv) {
+                activity?.requestedOrientation = if (videoPlaybackAspect < 1f) {
+                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                } else {
+                    ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                }
             }
         }
         DisposableEffect(activity) {
-            onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
+            onDispose {
+                if (!tv) activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
         }
         val videoPlaybackSize by viewModel.videoPlaybackSize.collectAsState()
         val buffering by viewModel.videoBuffering.collectAsState()
@@ -263,10 +259,11 @@ fun MainScreen(
             context.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
         }
         var showSpeedSelector by remember { mutableStateOf(false) }
-        BackHandler { 
-            viewModel.stopVideoPlayback()
-            if (hideOnDisconnect) {
-                activity?.moveTaskToBack(true)
+        BackHandler {
+            if (tv && overlayVisible) {
+                overlayVisible = false
+            } else {
+                viewModel.stopVideoPlayback()
             }
         }
 
@@ -539,28 +536,25 @@ fun MainScreen(
         }
     }
 
-    // exit fullscreen while a pin is being shown so the dialog isn't covered
-    LaunchedEffect(pin) {
-        if (pin != null) fullscreen = false
+    val exitFullscreen: () -> Unit = {
+        exitedFullscreenForSession = mirrorSessionSeq
+        manualFullscreenSession = -1L
+        if (connections == 0 && hideOnDisconnect) {
+            (activity as? MainActivity)?.performRetreatToDesktop()
+                ?: activity?.moveTaskToBack(true)
+        }
+    }
+    val enterFullscreen: () -> Unit = {
+        manualFullscreenSession = mirrorSessionSeq
+        exitedFullscreenForSession = -1L
     }
 
-    val tv = isTv()
     if (fullscreen) {
-        BackHandler {
-            fullscreen = false
-            if (connections == 0 || (tv && hideOnDisconnect)) {
-                activity?.moveTaskToBack(true)
-            }
-        }
+        BackHandler { exitFullscreen() }
         FullscreenVideo(
             viewModel = viewModel,
             video = video,
-            onExitFullscreen = {
-                fullscreen = false
-                if (connections == 0 || (tv && hideOnDisconnect)) {
-                    activity?.moveTaskToBack(true)
-                }
-            },
+            onExitFullscreen = exitFullscreen,
             onPip = onPip
         )
     } else if (tv) {
@@ -625,7 +619,7 @@ fun MainScreen(
             ) {
                 TabContent(
                     tab, viewModel, video,
-                    onFullscreen = { fullscreen = true }, onPip = onPip, onLocalNetwork = onLocalNetwork,
+                    onFullscreen = enterFullscreen, onPip = onPip, onLocalNetwork = onLocalNetwork,
                     showAudioMode = audioOnly
                 )
             }
@@ -656,7 +650,7 @@ fun MainScreen(
             Box(modifier = Modifier.padding(padding).consumeWindowInsets(padding)) {
                 TabContent(
                     tab, viewModel, video,
-                    onFullscreen = { fullscreen = true }, onPip = onPip, onLocalNetwork = onLocalNetwork,
+                    onFullscreen = enterFullscreen, onPip = onPip, onLocalNetwork = onLocalNetwork,
                     showAudioMode = audioOnly
                 )
             }
@@ -1146,10 +1140,12 @@ private fun FullscreenVideo(
     val videoResolution by viewModel.videoResolution.collectAsState()
     val debugEnabled by viewModel.pref(Prefs.DEBUG_ENABLED).collectAsState()
     val debugInfo by viewModel.debugInfo.collectAsState()
+    val tv = isTv()
 
-    var controlsVisible by remember { mutableStateOf(true) }
-    var tapTick by remember { mutableStateOf(0) }
+    var controlsVisible by remember { mutableStateOf(!tv) }
+    var tapTick by remember { mutableIntStateOf(0) }
     LaunchedEffect(tapTick) {
+        if (tv && tapTick == 0) return@LaunchedEffect
         controlsVisible = true
         delay(8000)
         controlsVisible = false

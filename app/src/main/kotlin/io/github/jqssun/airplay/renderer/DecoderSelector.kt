@@ -71,15 +71,18 @@ class DecoderSelector(private val ctx: Context) {
         return info.takeIf { !_canMeet(avcCaps, w, h, fps) && _canMeet(info.videoCaps(HEVC), w, h, fps) }
     }
 
-    fun software(mime: String, w: Int, h: Int): MediaCodecInfo? =
-        MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.firstOrNull { info ->
+    fun software(mime: String, w: Int, h: Int): MediaCodecInfo? {
+        val sw = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.filter { info ->
             !info.isEncoder && info.supportsMime(mime) &&
                 (if (Build.VERSION.SDK_INT >= 29) info.isSoftwareOnly
                 else info.name.lowercase().let {
                     it.startsWith("omx.google.") || it.startsWith("c2.android.") ||
                         (!it.startsWith("omx.") && !it.startsWith("c2."))
                 })
-        }?.takeIf { _portraitSafe(w, h, it.videoCaps(mime)::isSizeSupported) }
+        }
+        return sw.firstOrNull { _portraitSafe(w, h, it.videoCaps(mime)::isSizeSupported) }
+            ?: sw.firstOrNull { it.name.startsWith("c2.android.", ignoreCase = true) }
+    }
 
     fun adaptive(info: MediaCodecInfo, mime: String) = !_inList(noAdaptive, info.name) &&
         runCatching { info.getCapabilitiesForType(mime).isFeatureSupported(CodecCapabilities.FEATURE_AdaptivePlayback) }
@@ -88,12 +91,14 @@ class DecoderSelector(private val ctx: Context) {
     // most to least risky
     fun lowLatencyOptions(format: MediaFormat, info: MediaCodecInfo, mime: String, tryNum: Int): Boolean {
         var set = false
-        if (tryNum < 1) {
+        val isMtk = _inList(mtk, info.name)
+        // MediaTek C2/OMX VDEC deadlocks (0 output frames) on multi-instance when low-latency=1
+        if (tryNum < 1 && !isMtk) {
             format.setInteger("low-latency", 1)
             if (_lowLatency(info, mime)) return true
             set = true
         }
-        if (tryNum < 2) {
+        if (tryNum < 2 && !isMtk) {
             format.setInteger("vdec-lowlatency", 1)
             set = true
         }
@@ -186,6 +191,7 @@ class DecoderSelector(private val ctx: Context) {
         const val AVC = MediaFormat.MIMETYPE_VIDEO_AVC
         const val HEVC = MediaFormat.MIMETYPE_VIDEO_HEVC
         private val qti = listOf("omx.qcom", "c2.qti")
+        private val mtk = listOf("omx.mtk", "c2.mtk")
         private val noAdaptive = listOf("omx.intel", "omx.mtk")
         private val vendorLowLatency = listOf(
             listOf("omx.hisi", "c2.hisi") to mapOf(

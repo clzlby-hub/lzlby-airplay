@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import io.github.jqssun.airplay.renderer.DecoderSelector.Companion.videoCaps
@@ -27,9 +29,26 @@ class VideoRenderer(ctx: Context) {
     @Volatile var fps = 0; private set
     @Volatile var bitrateBps = 0L; private set
     @Volatile var frameCount = 0L; private set
+    @Volatile var decodedFrameCount = 0L; private set
     @Volatile var codecName = ""; private set
     @Volatile var droppedFrames = 0L; private set
     @Volatile var framePacingJitterUs = 0L; private set
+
+    val hasRenderedFrame: Boolean
+        get() = pipeline.hasFrame
+
+    private class PendingFrame(val data: ByteArray, val ntpTimeNs: Long)
+    private val _startupFrames = ArrayList<PendingFrame>(MAX_STARTUP_FRAMES)
+    private var _codecOutputFrames = 0L
+    private var _fallbackStage = 0
+    private var _recovering = false
+    private var drainThread: HandlerThread? = null
+    private var drainHandler: Handler? = null
+    private val trailingDrain = Runnable {
+        synchronized(lock) {
+            try { drainOutput() } catch (_: Exception) {}
+        }
+    }
 
     var enforceSdr = true
     var keyAllowFrameDrop = true
@@ -85,12 +104,22 @@ class VideoRenderer(ctx: Context) {
             .reduceOrNull { (w1, h1), (w2, h2) -> minOf(w1, w2) to minOf(h1, h2) } ?: (1920 to 1080)
 
     // codec per mirror session; pipeline persists across sessions
-    fun startSession() = synchronized(lock) { _resetStats() }
+    fun startSession() = synchronized(lock) {
+        _resetStats()
+        pipeline.resetFrame()
+        _startupFrames.clear()
+        _fallbackStage = 0
+    }
 
-    fun stopSession() = synchronized(lock) { stopCodec() }
+    fun stopSession() = synchronized(lock) {
+        stopCodec()
+        decodedFrameCount = 0
+        pipeline.resetFrame()
+        _startupFrames.clear()
+    }
 
     private fun _resetStats() {
-        fps = 0; bitrateBps = 0; frameCount = 0; codecName = ""
+        fps = 0; bitrateBps = 0; frameCount = 0; decodedFrameCount = 0; codecName = ""
         droppedFrames = 0; framePacingJitterUs = 0
         _framesThisSec = 0; _bytesThisSec = 0
     }
@@ -125,19 +154,37 @@ class VideoRenderer(ctx: Context) {
             _updateStats(data.size)
             if (videoWidth == 0 || videoHeight == 0) return
 
+            val keyframe = _isKeyframe(data, isH265)
             if (codec == null || isH265 != currentH265) {
                 // a stale reference frame decodes to corruption, so wait for a keyframe to (re)start
-                if (!_isKeyframe(data, isH265)) {
+                if (!keyframe) {
                     if (codec != null) stopCodec()
                     return
                 }
                 stopCodec()
+                _startupFrames.clear()
+            }
+
+            if (_codecOutputFrames == 0L) {
+                if (keyframe) _startupFrames.clear()
+                if (_startupFrames.size < MAX_STARTUP_FRAMES) {
+                    _startupFrames.add(PendingFrame(data.copyOf(), ntpTimeNs))
+                }
             }
 
             try {
                 if (codec == null) startCodec(isH265)
-                _feedToCodec(data, ntpTimeNs)
+                val queued = _feedToCodec(data, ntpTimeNs)
                 drainOutput()
+                if (!queued && !_recovering && _codecOutputFrames == 0L && _fallbackStage < 2) {
+                    _recoverStalledStartup(isH265)
+                }
+                if (codec != null) {
+                    drainHandler?.let {
+                        it.removeCallbacks(trailingDrain)
+                        it.postDelayed(trailingDrain, TRAILING_DRAIN_MS)
+                    }
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "Codec error, resetting", e)
                 stopCodec()
@@ -145,24 +192,43 @@ class VideoRenderer(ctx: Context) {
         }
     }
 
-    private fun _feedToCodec(data: ByteArray, ntpTimeNs: Long) {
-        val c = codec ?: return
+    private fun _recoverStalledStartup(h265: Boolean) {
+        val replay = _startupFrames.toList()
+        if (replay.isEmpty()) return
+        _fallbackStage++
+        Log.w(TAG, "Decoder stalled with 0 output frames; escalating to stage $_fallbackStage (replay=${replay.size})")
+        _recovering = true
+        try {
+            stopCodec()
+            startCodec(h265)
+            for (f in replay) {
+                _feedToCodec(f.data, f.ntpTimeNs)
+                drainOutput()
+            }
+        } finally {
+            _recovering = false
+        }
+    }
+
+    private fun _feedToCodec(data: ByteArray, ntpTimeNs: Long): Boolean {
+        val c = codec ?: return false
         // dropping a frame desyncs decoder until the next keyframe, but source would only send one on (re)connect
         val retries = if (firstFrameQueued) FEED_RETRIES else FIRST_FEED_RETRIES
         repeat(retries) {
             val idx = c.dequeueInputBuffer(FEED_WAIT_US)
             if (idx >= 0) {
-                val buf = c.getInputBuffer(idx) ?: return
+                val buf = c.getInputBuffer(idx) ?: return false
                 buf.clear()
                 buf.put(data)
                 c.queueInputBuffer(idx, 0, data.size, ntpTimeNs / 1000, 0)
                 firstFrameQueued = true
-                return
+                return true
             }
             drainOutput()
         }
         droppedFrames++
         Log.w(TAG, "Decoder input queue full; dropping frame. drops=$droppedFrames")
+        return false
     }
 
     private fun _isKeyframe(data: ByteArray, isH265: Boolean): Boolean {
@@ -186,6 +252,11 @@ class VideoRenderer(ctx: Context) {
     }
 
     private fun startCodec(h265: Boolean) {
+        if (drainThread == null) {
+            val t = HandlerThread("VideoDrain").apply { start() }
+            drainThread = t
+            drainHandler = Handler(t.looper)
+        }
         pipeline.start()
         pipeline.setVideoSize(videoWidth, videoHeight)
         val s = pipeline.inputSurface ?: return
@@ -194,15 +265,25 @@ class VideoRenderer(ctx: Context) {
         val info = (if (h265) hevcDecoder else avcDecoder) ?: error("no decoder selected for $mime")
 
         firstFrameQueued = false
+        _codecOutputFrames = 0L
         try {
-            _startWithLadder(info, mime, s, h265)
+            when {
+                _fallbackStage >= 2 -> {
+                    val sw = selector.software(mime, videoWidth, videoHeight) ?: info
+                    _startWithLadder(sw, mime, s, h265)
+                }
+                _fallbackStage == 1 -> {
+                    _startDecoder(MediaCodec.createByCodecName(info.name), _format(mime, info), s, h265)
+                }
+                else -> _startWithLadder(info, mime, s, h265)
+            }
         } catch (e: Exception) {
             // strict hw decoders reject configs beyond their real limits
             val sw = selector.software(mime, videoWidth, videoHeight) ?: throw e
             Log.w(TAG, "Hardware decoder failed, trying software fallback", e)
             _startWithLadder(sw, mime, s, h265)
         }
-        Log.i(TAG, "Video codec started: $mime ${videoWidth}x${videoHeight} ($codecName)")
+        Log.i(TAG, "Video codec started: $mime ${videoWidth}x${videoHeight} ($codecName) stage=$_fallbackStage")
     }
 
     private fun _startWithLadder(info: MediaCodecInfo, mime: String, s: Surface, h265: Boolean) {
@@ -251,6 +332,8 @@ class VideoRenderer(ctx: Context) {
     }
 
     private fun stopCodec() {
+        drainHandler?.removeCallbacks(trailingDrain)
+        _codecOutputFrames = 0L
         _frameIntervalIdx = 0
         _frameIntervalCount = 0
         _lastOutputFrameNs = 0L
@@ -265,12 +348,19 @@ class VideoRenderer(ctx: Context) {
         codec = null
     }
 
+    @Suppress("DEPRECATION")
     private fun drainOutput() {
         val c = codec ?: return
         val info = MediaCodec.BufferInfo()
         while (true) {
             val idx = c.dequeueOutputBuffer(info, 0)
+            if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED || idx == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                continue
+            }
             if (idx < 0) break
+            _codecOutputFrames++
+            decodedFrameCount++
+            if (_startupFrames.isNotEmpty()) _startupFrames.clear()
             _recordOutputFrameTime()
             if (scheduledOutputBufferRelease) {
                 // schedule frame at VSYNC matching its NTP presentation time
@@ -288,6 +378,10 @@ class VideoRenderer(ctx: Context) {
 
     fun release() = synchronized(lock) {
         stopCodec()
+        drainHandler?.removeCallbacksAndMessages(null)
+        drainHandler = null
+        drainThread?.quitSafely()
+        drainThread = null
         pipeline.release()
         _resetStats()
     }
@@ -324,5 +418,7 @@ class VideoRenderer(ctx: Context) {
         private const val FEED_WAIT_US = 20_000L
         private const val FEED_RETRIES = 10
         private const val FIRST_FEED_RETRIES = 50
+        private const val TRAILING_DRAIN_MS = 25L
+        private const val MAX_STARTUP_FRAMES = 12
     }
 }

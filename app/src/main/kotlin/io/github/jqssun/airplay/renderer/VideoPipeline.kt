@@ -31,7 +31,7 @@ class VideoPipeline {
     private var aTex = 0
     private var uTexMatrix = 0
     private val texMatrix = FloatArray(16)
-    private var hasFrame = false
+    @Volatile var hasFrame = false; private set
 
     private var surfaceTexture: SurfaceTexture? = null
     var inputSurface: Surface? = null; private set
@@ -59,6 +59,10 @@ class VideoPipeline {
         videoW = w
         videoH = h
         surfaceTexture?.setDefaultBufferSize(w, h)
+    }
+
+    fun resetFrame() {
+        hasFrame = false
     }
 
     fun release() {
@@ -135,6 +139,7 @@ class VideoPipeline {
             // no display: keep consuming so decoder doesn't stall
             egl.makeCurrent()
             st.updateTexImage()
+            st.getTransformMatrix(texMatrix)
             hasFrame = true
             return
         }

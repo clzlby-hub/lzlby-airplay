@@ -24,6 +24,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.github.jqssun.airplay.service.AirPlayService
 import io.github.jqssun.airplay.ui.MainScreen
+import io.github.jqssun.airplay.ui.isTvDevice
 import io.github.jqssun.airplay.ui.theme.AirPlayTheme
 import io.github.jqssun.airplay.viewmodel.LocalNetworkAccess
 import io.github.jqssun.airplay.viewmodel.MainViewModel
@@ -40,6 +41,26 @@ class MainActivity : ComponentActivity() {
     val isInPip = mutableStateOf(false)
     private val logCallback: (String) -> Unit = { viewModel.addLog(it) }
     private val pinCallback: (String?) -> Unit = { viewModel.showPin(it) }
+    private val stateChangedCallback: () -> Unit = { viewModel.updateFromService() }
+    private val clearRetreatSafetyRunnable = Runnable { viewModel.setRetreatingToDesktop(false) }
+    private val prepareBringToFrontCallback: () -> Unit = {
+        window.decorView.removeCallbacks(clearRetreatSafetyRunnable)
+        viewModel.setRetreatingToDesktop(false)
+    }
+    private val retreatCallback: () -> Boolean = { performRetreatToDesktop() }
+
+    fun performRetreatToDesktop(): Boolean {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return false
+        if (viewModel.retreatingToDesktop.value) return false
+        viewModel.setRetreatingToDesktop(true)
+        if (moveTaskToBack(true)) {
+            window.decorView.removeCallbacks(clearRetreatSafetyRunnable)
+            window.decorView.postDelayed(clearRetreatSafetyRunnable, 1200L)
+            return true
+        }
+        viewModel.setRetreatingToDesktop(false)
+        return false
+    }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -47,6 +68,9 @@ class MainActivity : ComponentActivity() {
             service = svc
             svc.logCallback = logCallback
             svc.pinCallback = pinCallback
+            svc.stateChangedCallback = stateChangedCallback
+            svc.prepareBringToFrontCallback = prepareBringToFrontCallback
+            svc.retreatToDesktopCallback = retreatCallback
             viewModel.bindService(svc)
             if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) _refreshForeground()
             _autoStart()
@@ -161,10 +185,28 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        window.decorView.removeCallbacks(clearRetreatSafetyRunnable)
+        viewModel.setRetreatingToDesktop(false)
+        viewModel.updateFromService()
+    }
+
     override fun onStart() {
         super.onStart()
+        window.decorView.removeCallbacks(clearRetreatSafetyRunnable)
+        viewModel.setRetreatingToDesktop(false)
+        viewModel.updateFromService()
         _syncLocalNetwork()
         _refreshForeground()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        window.decorView.removeCallbacks(clearRetreatSafetyRunnable)
+        viewModel.setRetreatingToDesktop(false)
+        viewModel.updateFromService()
     }
 
     fun enterPip() {
@@ -184,8 +226,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun _shouldAutoPip(): Boolean =
-        viewModel.serverState.value == AirPlayService.ServerState.RUNNING &&
-            viewModel.connectionCount.value > 0
+        !isTvDevice() &&
+            viewModel.serverState.value == AirPlayService.ServerState.RUNNING &&
+            (viewModel.mirroringActive.value || viewModel.videoPlaybackActive.value)
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
@@ -199,6 +242,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        window.decorView.removeCallbacks(clearRetreatSafetyRunnable)
+        viewModel.setRetreatingToDesktop(false)
         // never stop mid-session
         if (!viewModel.pref(Prefs.RUN_IN_BACKGROUND).value && !isChangingConfigurations &&
             viewModel.serverState.value == AirPlayService.ServerState.RUNNING &&
@@ -211,6 +256,9 @@ class MainActivity : ComponentActivity() {
         service?.let {
             if (it.logCallback === logCallback) it.logCallback = null
             if (it.pinCallback === pinCallback) it.pinCallback = null
+            if (it.stateChangedCallback === stateChangedCallback) it.stateChangedCallback = null
+            if (it.prepareBringToFrontCallback === prepareBringToFrontCallback) it.prepareBringToFrontCallback = null
+            if (it.retreatToDesktopCallback === retreatCallback) it.retreatToDesktopCallback = null
         }
         unbindService(connection)
         super.onDestroy()
